@@ -1,7 +1,7 @@
-use std::fmt::{self, Debug, Formatter};
 use std::{
-    io::Cursor,
-    net::{IpAddr, Ipv4Addr},
+    convert::TryFrom,
+    fmt::{self, Debug, Formatter},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
 use bitflags::bitflags;
@@ -15,6 +15,7 @@ mod srt;
 pub use self::srt::*;
 
 use super::PacketParseError;
+use fmt::Display;
 
 /// A UDP packet carrying control information
 ///
@@ -220,17 +221,83 @@ pub enum SocketType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShakeType {
     /// First handshake exchange in client-server connection
-    Induction = 1,
+    Induction,
 
     /// A rendezvous connection, initial connect request, 0
-    Waveahand = 0,
+    Waveahand,
 
     /// A rendezvous connection, response to initial connect request, -1
     /// Also a regular connection client response to the second handshake
-    Conclusion = -1,
+    Conclusion,
 
     /// Final rendezvous check, -2
-    Agreement = -2,
+    Agreement,
+
+    /// Reject
+    Rejection(RejectReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CoreRejectReason {
+    System = 1001,
+    Peer = 1002,
+    Resource = 1003,
+    Rogue = 1004,
+    Backlog = 1005,
+    Ipe = 1006,
+    Close = 1007,
+    Version = 1008,
+    RdvCookie = 1009,
+    BadSecret = 1010,
+    Unsecure = 1011,
+    MessageApi = 1012,
+    Congestion = 1013,
+    Filter = 1014,
+    Group = 1015,
+    Timeout = 1016,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerRejectReason {
+    Fallback = 2000,
+    KeyNotSup = 2001,
+    Filepath = 2002,
+    HostNotFound = 2003,
+    BadRequest = 2400,
+    Unauthorized = 2401,
+    Overload = 2402,
+    Forbidden = 2403,
+    Notfound = 2404,
+    BadMode = 2405,
+    Unacceptable = 2406,
+    Conflict = 2409,
+    NotSupMedia = 2415,
+    Locked = 2423,
+    FailedDepend = 2424,
+    InternalServerError = 2500,
+    Unimplemented = 2501,
+    Gateway = 2502,
+    Down = 2503,
+    Version = 2505,
+    NoRoom = 2507,
+}
+
+/// Reject code
+/// *must* be >= 1000
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Core reject codes, [1000, 2000)
+    Core(CoreRejectReason),
+    CoreUnrecognized(i32),
+
+    /// Server reject codes, [2000, 3000)
+    Server(ServerRejectReason),
+    ServerUnrecognized(i32),
+
+    /// User reject code, >3000
+    User(i32),
 }
 
 impl HandshakeVSInfo {
@@ -293,7 +360,7 @@ impl SocketType {
 }
 
 impl ControlPacket {
-    pub fn parse(buf: &mut impl Buf) -> Result<ControlPacket, PacketParseError> {
+    pub fn parse(buf: &mut impl Buf, is_ipv6: bool) -> Result<ControlPacket, PacketParseError> {
         let control_type = buf.get_u16() << 1 >> 1; // clear first bit
 
         // get reserved data, which is the last two bytes of the first four bytes
@@ -306,7 +373,13 @@ impl ControlPacket {
             timestamp,
             dest_sockid: SocketID(dest_sockid),
             // just match against the second byte, as everything is in that
-            control_type: ControlTypes::deserialize(control_type, reserved, add_info, buf)?,
+            control_type: ControlTypes::deserialize(
+                control_type,
+                reserved,
+                add_info,
+                buf,
+                is_ipv6,
+            )?,
         })
     }
 
@@ -365,6 +438,7 @@ impl ControlTypes {
         reserved: u16,
         extra_info: i32,
         mut buf: T,
+        is_ipv6: bool,
     ) -> Result<ControlTypes, PacketParseError> {
         match packet_type {
             0x0 => {
@@ -394,22 +468,23 @@ impl ControlTypes {
                 let init_seq_num = SeqNumber::new_truncate(buf.get_u32()); // TODO: should this truncate?
                 let max_packet_size = buf.get_u32();
                 let max_flow_size = buf.get_u32();
-                let shake_type = match ShakeType::from_i32(buf.get_i32()) {
+                let shake_type = match ShakeType::try_from(buf.get_i32()) {
                     Ok(ct) => ct,
                     Err(err_ct) => return Err(PacketParseError::BadConnectionType(err_ct)),
                 };
                 let socket_id = SocketID(buf.get_u32());
                 let syn_cookie = buf.get_i32();
 
-                // get the IP
-                let mut ip_buf: [u8; 16] = [0; 16];
-                buf.copy_to_slice(&mut ip_buf);
-
-                // TODO: this is probably really wrong, so fix it
-                let peer_addr = if ip_buf[4..] == [0; 12][..] {
-                    IpAddr::from(Ipv4Addr::new(ip_buf[3], ip_buf[2], ip_buf[1], ip_buf[0]))
+                let peer_addr = if !is_ipv6 {
+                    let ip = buf.get_u32_le();
+                    buf.get_u32();
+                    buf.get_u32();
+                    buf.get_u32();
+                    IpAddr::from(Ipv4Addr::from(ip))
                 } else {
-                    IpAddr::from(ip_buf)
+                    let mut ip_buf = [0u8; 16];
+                    buf.copy_to_slice(&mut ip_buf);
+                    IpAddr::from(Ipv6Addr::from(ip_buf))
                 };
 
                 let info = match udt_version {
@@ -464,17 +539,16 @@ impl ControlTypes {
                                     return Err(PacketParseError::NotEnoughData);
                                 }
 
-                                let buffer = &buf.bytes()[..pack_size];
+                                let mut srt_pack_rd = buf.take(pack_size);
 
                                 let ret = match pack_type {
                                     // 1 and 2 are handshake response and requests
-                                    1 | 2 => Some(SrtControlPacket::parse(
-                                        pack_type,
-                                        &mut Cursor::new(buffer),
-                                    )?),
+                                    1 | 2 => {
+                                        Some(SrtControlPacket::parse(pack_type, &mut srt_pack_rd)?)
+                                    }
                                     e => return Err(PacketParseError::BadSRTHsExtensionType(e)),
                                 };
-                                buf.advance(pack_size);
+                                buf = srt_pack_rd.into_inner();
 
                                 ret
                             } else {
@@ -507,12 +581,9 @@ impl ControlTypes {
                                         return Err(PacketParseError::NotEnoughData);
                                     }
 
-                                    let buffer = &buf.bytes()[..pack_size];
+                                    let mut buffer = buf.take(pack_size);
 
-                                    match SrtControlPacket::parse(
-                                        pack_type,
-                                        &mut Cursor::new(&buffer),
-                                    )? {
+                                    match SrtControlPacket::parse(pack_type, &mut buffer)? {
                                         // 5 is sid 6 is smoother
                                         SrtControlPacket::StreamId(stream_id) => {
                                             sid = Some(stream_id)
@@ -520,7 +591,7 @@ impl ControlTypes {
                                         _ => unimplemented!("Implement other kinds"),
                                     }
 
-                                    buf.advance(pack_size);
+                                    buf = buffer.into_inner();
                                 }
                             }
                             HandshakeVSInfo::V5(HSV5Info {
@@ -545,7 +616,13 @@ impl ControlTypes {
                     info,
                 }))
             }
-            0x1 => Ok(ControlTypes::KeepAlive),
+            0x1 => {
+                // discard the "unused" packet field, if it exists
+                if buf.remaining() >= 4 {
+                    buf.get_u32();
+                }
+                Ok(ControlTypes::KeepAlive)
+            }
             0x2 => {
                 // ACK
 
@@ -598,9 +675,17 @@ impl ControlTypes {
 
                 Ok(ControlTypes::Nak(loss_info))
             }
-            0x5 => Ok(ControlTypes::Shutdown),
+            0x5 => {
+                if buf.remaining() >= 4 {
+                    buf.get_u32(); // discard "unused" packet field
+                }
+                Ok(ControlTypes::Shutdown)
+            }
             0x6 => {
                 // ACK2
+                if buf.remaining() >= 4 {
+                    buf.get_u32(); // discard "unused" packet field
+                }
                 Ok(ControlTypes::Ack2(extra_info))
             }
             0x7 => {
@@ -663,24 +748,22 @@ impl ControlTypes {
                 into.put_u32(c.init_seq_num.as_raw());
                 into.put_u32(c.max_packet_size);
                 into.put_u32(c.max_flow_size);
-                into.put_i32(c.shake_type as i32);
+                into.put_i32(c.shake_type.into());
                 into.put_u32(c.socket_id.0);
                 into.put_i32(c.syn_cookie);
 
                 match c.peer_addr {
                     IpAddr::V4(four) => {
-                        let mut v = Vec::from(&four.octets()[..]);
-                        v.reverse(); // reverse bytes
-                        into.put(&v[..]);
+                        let v = u32::from(four);
+                        into.put_u32_le(v);
 
                         // the data structure reuiqres enough space for an ipv6, so pad the end with 16 - 4 = 12 bytes
                         into.put(&[0; 12][..]);
                     }
                     IpAddr::V6(six) => {
-                        let mut v = Vec::from(&six.octets()[..]);
-                        v.reverse();
+                        let v = u128::from(six);
 
-                        into.put(&v[..]);
+                        into.put_u128(v);
                     }
                 }
 
@@ -853,26 +936,220 @@ impl Debug for HandshakeVSInfo {
     }
 }
 
-impl ShakeType {
+impl TryFrom<i32> for ShakeType {
     /// Turns an i32 into a `ConnectionType`, returning Err(num) if no valid one was passed.
-    pub fn from_i32(num: i32) -> Result<ShakeType, i32> {
-        match num {
+    type Error = i32;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
             1 => Ok(ShakeType::Induction),
             0 => Ok(ShakeType::Waveahand),
             -1 => Ok(ShakeType::Conclusion),
             -2 => Ok(ShakeType::Agreement),
-            i => Err(i),
+            i if i < 1000 => Err(i), // not a basic type and not a rejection code
+            i => Ok(ShakeType::Rejection(RejectReason::try_from(i).unwrap())), // unwrap is safe--will always be >= 1000
         }
+    }
+}
+
+impl Into<i32> for ShakeType {
+    fn into(self) -> i32 {
+        match self {
+            ShakeType::Induction => 1,
+            ShakeType::Waveahand => 0,
+            ShakeType::Conclusion => -1,
+            ShakeType::Agreement => -2,
+            ShakeType::Rejection(rej) => rej.into(),
+        }
+    }
+}
+
+/// Returns error if value < 1000
+impl TryFrom<i32> for RejectReason {
+    type Error = i32;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            v if v < 1000 => Err(v),
+            v if v < 2000 => Ok(match CoreRejectReason::try_from(v) {
+                Ok(rr) => RejectReason::Core(rr),
+                Err(rr) => RejectReason::CoreUnrecognized(rr),
+            }),
+            v if v < 3000 => Ok(match ServerRejectReason::try_from(v) {
+                Ok(rr) => RejectReason::Server(rr),
+                Err(rr) => RejectReason::ServerUnrecognized(rr),
+            }),
+            v => Ok(RejectReason::User(v)),
+        }
+    }
+}
+
+impl Into<i32> for RejectReason {
+    fn into(self) -> i32 {
+        match self {
+            RejectReason::Core(c) => c.into(),
+            RejectReason::CoreUnrecognized(c) => c,
+            RejectReason::Server(s) => s.into(),
+            RejectReason::ServerUnrecognized(s) => s,
+            RejectReason::User(u) => u,
+        }
+    }
+}
+
+impl Display for RejectReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            RejectReason::Core(c) => write!(f, "{}", c),
+            RejectReason::CoreUnrecognized(c) => write!(f, "Unrecognized core error: {}", c),
+            RejectReason::Server(s) => write!(f, "{}", s),
+            RejectReason::ServerUnrecognized(s) => write!(f, "Unrecognized server error: {}", s),
+            RejectReason::User(u) => write!(f, "User error: {}", u),
+        }
+    }
+}
+
+impl Into<RejectReason> for CoreRejectReason {
+    fn into(self) -> RejectReason {
+        RejectReason::Core(self)
+    }
+}
+
+impl TryFrom<i32> for CoreRejectReason {
+    type Error = i32;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        use CoreRejectReason::*;
+        Ok(match value {
+            1001 => System,
+            1002 => Peer,
+            1003 => Resource,
+            1004 => Rogue,
+            1005 => Backlog,
+            1006 => Ipe,
+            1007 => Close,
+            1008 => Version,
+            1009 => RdvCookie,
+            1010 => BadSecret,
+            1011 => Unsecure,
+            1012 => MessageApi,
+            1013 => Congestion,
+            1014 => Filter,
+            1015 => Group,
+            1016 => Timeout,
+            other => return Err(other),
+        })
+    }
+}
+
+impl Into<i32> for CoreRejectReason {
+    fn into(self) -> i32 {
+        self as i32
+    }
+}
+
+impl Display for CoreRejectReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            CoreRejectReason::System => write!(f, "broken due to system function error"),
+            CoreRejectReason::Peer => write!(f, "connection was rejected by peer"),
+            CoreRejectReason::Resource => write!(f, "internal problem with resource allocation"),
+            CoreRejectReason::Rogue => write!(f, "incorrect data in handshake messages"),
+            CoreRejectReason::Backlog => write!(f, "listener's backlog exceeded"),
+            CoreRejectReason::Ipe => write!(f, "internal program error"),
+            CoreRejectReason::Close => write!(f, "socket is closing"),
+            CoreRejectReason::Version => {
+                write!(f, "peer is older version than agent's minimum set")
+            }
+            CoreRejectReason::RdvCookie => write!(f, "rendezvous cookie collision"),
+            CoreRejectReason::BadSecret => write!(f, "wrong password"),
+            CoreRejectReason::Unsecure => write!(f, "password required or unexpected"),
+            CoreRejectReason::MessageApi => write!(f, "streamapi/messageapi collision"),
+            CoreRejectReason::Congestion => write!(f, "incompatible congestion-controller type"),
+            CoreRejectReason::Filter => write!(f, "incompatible packet filter"),
+            CoreRejectReason::Group => write!(f, "incompatible group"),
+            CoreRejectReason::Timeout => write!(f, "connection timeout"),
+        }
+    }
+}
+
+impl Into<RejectReason> for ServerRejectReason {
+    fn into(self) -> RejectReason {
+        RejectReason::Server(self)
+    }
+}
+
+impl TryFrom<i32> for ServerRejectReason {
+    type Error = i32;
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        Ok(match value {
+            2000 => ServerRejectReason::Fallback,
+            2001 => ServerRejectReason::KeyNotSup,
+            2002 => ServerRejectReason::Filepath,
+            2003 => ServerRejectReason::HostNotFound,
+            2400 => ServerRejectReason::BadRequest,
+            2401 => ServerRejectReason::Unauthorized,
+            2402 => ServerRejectReason::Overload,
+            2403 => ServerRejectReason::Forbidden,
+            2404 => ServerRejectReason::Notfound,
+            2405 => ServerRejectReason::BadMode,
+            2406 => ServerRejectReason::Unacceptable,
+            2409 => ServerRejectReason::Conflict,
+            2415 => ServerRejectReason::NotSupMedia,
+            2423 => ServerRejectReason::Locked,
+            2424 => ServerRejectReason::FailedDepend,
+            2500 => ServerRejectReason::InternalServerError,
+            2501 => ServerRejectReason::Unimplemented,
+            2502 => ServerRejectReason::Gateway,
+            2503 => ServerRejectReason::Down,
+            2505 => ServerRejectReason::Version,
+            2507 => ServerRejectReason::NoRoom,
+            unrecog => return Err(unrecog),
+        })
+    }
+}
+
+impl Into<i32> for ServerRejectReason {
+    fn into(self) -> i32 {
+        self as i32
+    }
+}
+
+impl Display for ServerRejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+                ServerRejectReason::Fallback =>
+                    write!(f, "the application wants to report some problem, but can't precisely specify it"),
+                ServerRejectReason::KeyNotSup =>
+                    write!(f, "The key used in the StreamID keyed string is not supported by the service"),
+                ServerRejectReason::Filepath =>write!(f, "The resource type designates a file and the path is either wrong syntax or not found"),
+                ServerRejectReason::HostNotFound => write!(f, "The `h` host specification was not recognized by the service"),
+                ServerRejectReason::BadRequest => write!(f, "General syntax error in the SocketID specification (also a fallback code for undefined cases)"),
+                ServerRejectReason::Unauthorized => write!(f, "Authentication failed, provided that the user was correctly identified and access to the required resource would be granted"),
+                ServerRejectReason::Overload => write!(f, "The server is too heavily loaded, or you have exceeded credits for accessing the service and the resource"),
+                ServerRejectReason::Forbidden => write!(f, "Access denied to the resource by any kind of reason"),
+                ServerRejectReason::Notfound => write!(f, "Resource not found at this time"),
+                ServerRejectReason::BadMode => write!(f, "The mode specified in `m` key in StreamID is not supported for this request"),
+                ServerRejectReason::Unacceptable => write!(f, "The requested parameters specified in SocketID cannot be satisfied for the requested resource. Also when m=publish and the data format is not acceptable"),
+                ServerRejectReason::Conflict => write!(f, "The resource being accessed is already locked for modification. This is in case of m=publish and the specified resource is currently read-only"),
+                ServerRejectReason::NotSupMedia => write!(f, "The media type is not supported by the application. This is the `t` key that specifies the media type as stream, file and auth, possibly extended by the application"),
+                ServerRejectReason::Locked => write!(f, "The resource being accessed is locked for any access"),
+                ServerRejectReason::FailedDepend => write!(f, "The request failed because it specified a dependent session ID that has been disconnected"),
+                ServerRejectReason::InternalServerError => write!(f, "Unexpected internal server error"),
+                ServerRejectReason::Unimplemented => write!(f, "The request was recognized, but the current version doesn't support it (unimplemented)"),
+                ServerRejectReason::Gateway => write!(f, "The server acts as a gateway and the target endpoint rejected the connection"),
+                ServerRejectReason::Down => write!(f, "The service has been temporarily taken over by a stub reporting this error. The real service can be down for maintenance or crashed"),
+                ServerRejectReason::Version => write!(f, "SRT version not supported. This might be either unsupported backward compatibility, or an upper value of a version"),
+                ServerRejectReason::NoRoom => write!(f, "The data stream cannot be archived due to lacking storage space. This is in case when the request type was to send a file or the live stream to be archived"),
+            }
     }
 }
 
 #[cfg(test)]
 mod test {
 
+    use bytes::BytesMut;
+
     use super::*;
     use crate::{SeqNumber, SocketID, SrtVersion};
-    use std::io::Cursor;
     use std::time::Duration;
+    use std::{convert::TryInto, io::Cursor};
 
     #[test]
     fn handshake_ser_des_test() {
@@ -901,11 +1178,11 @@ mod test {
             }),
         };
 
-        let mut buf = vec![];
+        let mut buf = BytesMut::with_capacity(128);
         pack.serialize(&mut buf);
 
-        let des = ControlPacket::parse(&mut Cursor::new(buf)).unwrap();
-
+        let des = ControlPacket::parse(&mut buf, false).unwrap();
+        assert!(buf.is_empty());
         assert_eq!(pack, des);
     }
 
@@ -925,11 +1202,11 @@ mod test {
             }),
         };
 
-        let mut buf = vec![];
+        let mut buf = BytesMut::with_capacity(128);
         pack.serialize(&mut buf);
 
-        let des = ControlPacket::parse(&mut Cursor::new(buf)).unwrap();
-
+        let des = ControlPacket::parse(&mut buf, false).unwrap();
+        assert!(buf.is_empty());
         assert_eq!(pack, des);
     }
 
@@ -942,14 +1219,14 @@ mod test {
         };
         assert_eq!(pack.control_type.additional_info(), 831);
 
-        let mut buf = vec![];
+        let mut buf = BytesMut::with_capacity(128);
         pack.serialize(&mut buf);
 
         // dword 2 should have 831 in big endian, so the last two bits of the second dword
         assert_eq!((u32::from(buf[6]) << 8) + u32::from(buf[7]), 831);
 
-        let des = ControlPacket::parse(&mut Cursor::new(buf)).unwrap();
-
+        let des = ControlPacket::parse(&mut buf, false).unwrap();
+        assert!(buf.is_empty());
         assert_eq!(pack, des);
     }
 
@@ -960,7 +1237,7 @@ mod test {
         let packet_data =
             hex::decode("FFFF000000000000000189702BFFEFF2000103010000001E00000078").unwrap();
 
-        let packet = ControlPacket::parse(&mut Cursor::new(packet_data)).unwrap();
+        let packet = ControlPacket::parse(&mut Cursor::new(packet_data), false).unwrap();
 
         assert_eq!(
             packet,
@@ -973,10 +1250,39 @@ mod test {
     }
 
     #[test]
+    fn raw_handshake_ipv6() {
+        let packet_data = hex::decode("8000000000000000000002b00000000000000004000000023c3b0296000005dc00002000000000010669ead20000000000000000000000000000000001000000").unwrap();
+        let packet = ControlPacket::parse(&mut Cursor::new(&packet_data[..]), true).unwrap();
+
+        let r = ControlPacket {
+            timestamp: TimeStamp::from_micros(688),
+            dest_sockid: SocketID(0),
+            control_type: ControlTypes::Handshake(HandshakeControlInfo {
+                init_seq_num: SeqNumber(1010500246),
+                max_packet_size: 1500,
+                max_flow_size: 8192,
+                shake_type: ShakeType::Induction,
+                socket_id: SocketID(0x0669EAD2),
+                syn_cookie: 0,
+                peer_addr: "::1.0.0.0".parse().unwrap(),
+                info: HandshakeVSInfo::V4(SocketType::Datagram),
+            }),
+        };
+
+        assert_eq!(packet, r);
+
+        // reserialize it
+        let mut buf = vec![];
+        packet.serialize(&mut buf);
+
+        assert_eq!(&buf[..], &packet_data[..]);
+    }
+
+    #[test]
     fn raw_handshake_srt() {
         // this is a example HSv5 conclusion packet from the reference implementation
         let packet_data = hex::decode("8000000000000000000F9EC400000000000000050000000144BEA60D000005DC00002000FFFFFFFF3D6936B6E3E405DD0100007F00000000000000000000000000010003000103010000002F00780000").unwrap();
-        let packet = ControlPacket::parse(&mut Cursor::new(&packet_data[..])).unwrap();
+        let packet = ControlPacket::parse(&mut Cursor::new(&packet_data[..]), false).unwrap();
         assert_eq!(
             packet,
             ControlPacket {
@@ -1017,10 +1323,57 @@ mod test {
     }
 
     #[test]
+    fn raw_handshake_sid() {
+        // this is an example HSv5 conclusion packet from the reference implementation that has a
+        // stream id.
+        let packet_data = hex::decode("800000000000000000000b1400000000000000050000000563444b2e000005dc00002000ffffffff37eb0ee52154fbd60100007f0000000000000000000000000001000300010401000000bf0014001400050003646362616867666500006a69").unwrap();
+        let packet = ControlPacket::parse(&mut Cursor::new(&packet_data[..]), false).unwrap();
+        assert_eq!(
+            packet,
+            ControlPacket {
+                timestamp: TimeStamp::from_micros(2836),
+                dest_sockid: SocketID(0),
+                control_type: ControlTypes::Handshake(HandshakeControlInfo {
+                    init_seq_num: SeqNumber(1_665_420_078),
+                    max_packet_size: 1500,
+                    max_flow_size: 8192,
+                    shake_type: ShakeType::Conclusion,
+                    socket_id: SocketID(0x37eb0ee5),
+                    syn_cookie: 559_217_622,
+                    peer_addr: "127.0.0.1".parse().unwrap(),
+                    info: HandshakeVSInfo::V5(HSV5Info {
+                        crypto_size: 0,
+                        ext_hs: Some(SrtControlPacket::HandshakeRequest(SrtHandshake {
+                            version: SrtVersion::new(1, 4, 1),
+                            flags: SrtShakeFlags::TSBPDSND
+                                | SrtShakeFlags::TSBPDRCV
+                                | SrtShakeFlags::HAICRYPT
+                                | SrtShakeFlags::REXMITFLG
+                                | SrtShakeFlags::TLPKTDROP
+                                | SrtShakeFlags::NAKREPORT
+                                | SrtShakeFlags::FILTERCAP,
+                            send_latency: Duration::from_millis(20),
+                            recv_latency: Duration::from_millis(20)
+                        })),
+                        ext_km: None,
+                        sid: Some(String::from("abcdefghij")),
+                    })
+                })
+            }
+        );
+
+        // reserialize it
+        let mut buf = vec![];
+        packet.serialize(&mut buf);
+
+        assert_eq!(&buf[..], &packet_data[..]);
+    }
+
+    #[test]
     fn raw_handshake_crypto() {
         // this is an example HSv5 conclusion packet from the reference implementation that has crypto data embedded.
         let packet_data = hex::decode("800000000000000000175E8A0000000000000005000000036FEFB8D8000005DC00002000FFFFFFFF35E790ED5D16CCEA0100007F00000000000000000000000000010003000103010000002F01F401F40003000E122029010000000002000200000004049D75B0AC924C6E4C9EC40FEB4FE973DB1D215D426C18A2871EBF77E2646D9BAB15DBD7689AEF60EC").unwrap();
-        let packet = ControlPacket::parse(&mut Cursor::new(&packet_data[..])).unwrap();
+        let packet = ControlPacket::parse(&mut Cursor::new(&packet_data[..]), false).unwrap();
 
         assert_eq!(
             packet,
@@ -1074,7 +1427,7 @@ mod test {
     #[test]
     fn raw_handshake_crypto_pt2() {
         let packet_data = hex::decode("8000000000000000000000000C110D94000000050000000374B7526E000005DC00002000FFFFFFFF18C1CED1F3819B720100007F00000000000000000000000000020003000103010000003F03E803E80004000E12202901000000000200020000000404D3B3D84BE1188A4EBDA4DA16EA65D522D82DE544E1BE06B6ED8128BF15AA4E18EC50EAA95546B101").unwrap();
-        let _packet = ControlPacket::parse(&mut Cursor::new(&packet_data[..])).unwrap();
+        let _packet = ControlPacket::parse(&mut Cursor::new(&packet_data[..]), false).unwrap();
         dbg!(&_packet);
     }
 
@@ -1085,7 +1438,7 @@ mod test {
             hex::decode("800200000000000e000246e5d96d5e1a389c24780000452900007bb000001fa9")
                 .unwrap();
 
-        let _cp = ControlPacket::parse(&mut Cursor::new(packet_data)).unwrap();
+        let _cp = ControlPacket::parse(&mut Cursor::new(packet_data), false).unwrap();
     }
 
     #[test]
@@ -1110,11 +1463,11 @@ mod test {
             }),
         };
 
-        let mut ser = vec![];
+        let mut ser = BytesMut::with_capacity(128);
         pack.serialize(&mut ser);
 
-        let pack_deser = ControlPacket::parse(&mut Cursor::new(&ser)).unwrap();
-
+        let pack_deser = ControlPacket::parse(&mut ser, false).unwrap();
+        assert!(ser.is_empty());
         assert_eq!(pack, pack_deser);
     }
 
@@ -1140,11 +1493,37 @@ mod test {
             }),
         };
 
-        let mut ser = vec![];
+        let mut ser = BytesMut::with_capacity(128);
         pack.serialize(&mut ser);
 
-        let pack_deser = ControlPacket::parse(&mut Cursor::new(&ser)).unwrap();
-
+        let pack_deser = ControlPacket::parse(&mut ser, false).unwrap();
         assert_eq!(pack, pack_deser);
+        assert!(ser.is_empty());
+    }
+
+    #[test]
+    fn test_keepalive() {
+        let pack = ControlPacket {
+            timestamp: TimeStamp::from_micros(0),
+            dest_sockid: SocketID(0),
+            control_type: ControlTypes::KeepAlive,
+        };
+
+        let mut ser = BytesMut::with_capacity(128);
+        pack.serialize(&mut ser);
+
+        let pack_deser = ControlPacket::parse(&mut ser, false).unwrap();
+        assert_eq!(pack, pack_deser);
+        assert!(ser.is_empty());
+    }
+
+    #[test]
+    fn test_reject_reason_deser_ser() {
+        assert_eq!(
+            Ok(RejectReason::Server(ServerRejectReason::Unimplemented)),
+            <i32 as TryInto<RejectReason>>::try_into(
+                RejectReason::Server(ServerRejectReason::Unimplemented).into()
+            )
+        );
     }
 }
